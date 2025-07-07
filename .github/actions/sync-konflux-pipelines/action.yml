@@ -54,7 +54,7 @@ runs:
       run: |
         python3 -m pip install --user requests PyYAML
 
-        - name: Prepare pipeline sync script
+    - name: Prepare pipeline sync script
       shell: bash
       run: |
         # Create a wrapper script that sets environment variables for the main script
