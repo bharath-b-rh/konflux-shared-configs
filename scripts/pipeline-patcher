@@ -1,0 +1,715 @@
+#!/bin/bash
+set -euo pipefail
+
+KONFLUX_CATALOG=quay.io/konflux-ci/tekton-catalog
+
+# Use with a pipe to indent some text
+indented() {
+    awk '{print "  " $0}'
+}
+
+# Extract trusted task data from the acceptable bundles data bundle
+_trusted_task_data() {
+    local acceptable_bundles_repo="$KONFLUX_CATALOG/data-acceptable-bundles"
+
+    local blob_digest=$(oras manifest fetch "$acceptable_bundles_repo:latest" | jq -r '.layers[0].digest')
+
+    oras blob fetch "$acceptable_bundles_repo@$blob_digest" --output -
+}
+
+# Cache it so we aren't doing the expensive blob fetch multiple times
+_trusted_task_cache=$(mktemp)
+trap "rm -f $_trusted_task_cache" EXIT
+trusted_task_data() {
+    if [[ ! -s $_trusted_task_cache ]]; then
+        _trusted_task_data > $_trusted_task_cache
+    fi
+    cat $_trusted_task_cache
+}
+
+# Find the digest and full image ref for a given task bundle
+# Use the acceptable bundles data bundle
+get_pinned_task_bundle_ref() {
+    local task_name_or_ref=$1
+    local tag_maybe=${2:-""}
+
+    # Do some extra work so it behaves usefully if $task_name_or_ref
+    # contains a full bundle ref. Strip off the quay repo prefix...
+    task_name_or_ref="${task_name_or_ref#$KONFLUX_CATALOG/task-}"
+    # ...and also the sha256 digest suffix
+    task_name_or_ref="${task_name_or_ref%@sha256:*}"
+
+    if [[ "$task_name_or_ref" =~ : ]]; then
+        # Assume the name and tag are together with a colon between
+        # them, e.g. "some-task:0.2"
+        task_name="${task_name_or_ref%%:*}"
+        tag="${task_name_or_ref#*:}"
+    else
+        # Otherwise use the second argument as the tag
+        task_name=$task_name_or_ref
+        tag=$tag_maybe
+    fi
+
+    local task_repo=$KONFLUX_CATALOG/task-$task_name
+    local trusted_task_key="oci://$task_repo:$tag"
+
+    # Assume the first one is is the newest and best
+    local digest=$(trusted_task_data | yq ".trusted_tasks.\"$trusted_task_key\"[0].ref")
+
+    if [[ $digest == "null" ]]; then
+        echo "Can't find $trusted_task_key in the trusted task list. Aborting."
+        exit 1
+    fi
+
+    # Include the tag as well as the digest
+    echo "$task_repo:$tag@$digest"
+}
+
+# Prepare tekton bundles resolver data for injection into the pipeline task yaml
+bundle_resolver_data() {
+    local task_name=$1
+    local version=$2
+
+    local bundle_ref=$(get_pinned_task_bundle_ref $task_name $version)
+
+    jq -c <<END_JSON
+        {
+            "params": [
+                { "name": "name",   "value": "$task_name" },
+                { "name": "bundle", "value": "$bundle_ref" },
+                { "name": "kind",   "value": "task" }
+            ],
+            "resolver": "bundles"
+        }
+END_JSON
+}
+
+# Base URL for curl fetching
+GIT_REF=main
+BUILD_DEFS_URL=https://raw.githubusercontent.com/konflux-ci/build-definitions/refs/heads/${GIT_REF}
+
+# Todo: Support finding tasks in all the non-docker pipelines.
+
+# There are two simliar docker-build pipeline definitions, one conventional,
+# and one that uses the oci trusted artifacts versions of the important tasks
+PIPELINE_YAML=${BUILD_DEFS_URL}/pipelines/docker-build/docker-build.yaml
+PIPELINE_YAML_OCI_TA=${BUILD_DEFS_URL}/pipelines/docker-build-oci-ta/docker-build-oci-ta.yaml
+
+# The FBC pipeline has FBC specific tasks not found in the docker-build pipeline
+PIPELINE_YAML_FBC=${BUILD_DEFS_URL}/pipelines/fbc-builder/fbc-builder.yaml
+
+# For the tkn-bundle task which is not in either of the above
+PIPELINE_YAML_TKN_BUNDLE=${BUILD_DEFS_URL}/pipelines/tekton-bundle-builder/tekton-bundle-builder.yaml
+PIPELINE_YAML_TKN_BUNDLE_OCI_TA=${BUILD_DEFS_URL}/pipelines/tekton-bundle-builder-oci-ta/tekton-bundle-builder-oci-ta.yaml
+
+# Find the task in the pipeline definition from build-definitions repo
+# and extract its yaml snippet
+extract_pipeline_task_raw_yaml() {
+    local task_name=$1
+
+    # Detect an oci-ta or fbc task and choose the appropriate pipeline
+    # (Beware there are probably edge cases where this isn't going to work.
+    # Set pipeline_url manually here if you need to.)
+    if [[ "${task_name}" =~ ^fbc-|-fbc$ ]]; then
+        local pipeline_url=${PIPELINE_YAML_FBC}
+
+    elif [[ "${task_name}" = "tkn-bundle" ]]; then
+        local pipeline_url=${PIPELINE_YAML_TKN_BUNDLE}
+
+    elif [[ "${task_name}" = "tkn-bundle-oci-ta" ]]; then
+        local pipeline_url=${PIPELINE_YAML_TKN_BUNDLE_OCI_TA}
+
+    elif [[ "${task_name}" =~ -oci-ta ]]; then
+        local pipeline_url=${PIPELINE_YAML_OCI_TA}
+
+    else
+        local pipeline_url=${PIPELINE_YAML}
+    fi
+
+    # Output the task's yaml, (as a list of length one for convenience)
+    curl -s "${pipeline_url}" | yq ".spec.tasks[] | select(.taskRef.name == \"${task_name}\") | [.]"
+}
+
+# Show a list of tasks that we could get yaml snippets for.
+# Include the task's version in the output.
+_fetch_known_tasks() {
+    for p in $PIPELINE_YAML_OCI_TA $PIPELINE_YAML $PIPELINE_YAML_FBC $PIPELINE_YAML_TKN_BUNDLE_OCI_TA $PIPELINE_YAML_TKN_BUNDLE; do
+        curl -s "$p" | yq '.spec.tasks[].taskRef | (.name + " " + .version)' ;
+    done | sort -u
+}
+
+# A memoized version of the above so we can refer to this list
+# more than once without needing to refetch it
+_known_tasks_memo=""
+list_known_tasks() {
+    if [[ -z "$_known_tasks_memo" ]]; then
+        _known_tasks_memo=$(_fetch_known_tasks)
+    fi
+    echo "$_known_tasks_memo"
+}
+
+task_exists() {
+    local task_name=$1
+
+    list_known_tasks | grep -qE "^$task_name "
+}
+
+oci_ta_task_exists() {
+    local task_name=$1
+
+    task_exists "$task_name-oci-ta"
+}
+
+# Put together a yaml snippet with a bundle resolved taskRef ready to insert
+# into a Konflux pipeline
+extract_pipeline_task() {
+    local task_name=$1
+
+    # Extract the raw yaml snippet
+    local task_yaml=$(extract_pipeline_task_raw_yaml $task_name)
+
+    if [[ "$task_yaml" == "[]" ]]; then
+        echo "Task '$task_name' not found. Aborting. Known tasks:"
+        list_known_tasks | indented
+        exit 1
+    fi
+
+    # The version is something like 0.1 or 0.2. It should match the
+    # tag in the tekton bundle image ref
+    local task_version=$(yq '.[0].taskRef.version' <<< "$task_yaml")
+
+    # Compact json for the new bundle resolved taskRef
+    local bundle_task_ref=$(bundle_resolver_data $task_name $task_version)
+
+    # Replace the standard in-cluster taskRef with a bundle resolved taskRef
+    # and output the modified yaml
+    yq ".[0] + {\"taskRef\": $bundle_task_ref } | [.]" <<< "$task_yaml"
+}
+
+# Expected to be either Pipeline or PipelineRun
+get_pipeline_kind() {
+    local pipeline_file="$1"
+
+    yq '.kind' $pipeline_file
+}
+
+# Return a yq query that specifies where to find the tasks in the yaml pipeline file
+get_pipeline_spec_path() {
+    local pipeline_file="$1"
+
+    # So we can work with both a PipelineRun yaml file and a Pipeline yaml file
+    case $(get_pipeline_kind $pipeline_file) in
+        PipelineRun)
+            echo ".spec.pipelineSpec"
+            ;;
+        Pipeline)
+            echo ".spec"
+            ;;
+        *)
+            echo "Unexpected kind found in $pipeline_file. Aborting."
+            exit 1
+            ;;
+    esac
+}
+# Return a yq query that specifies where to find the tasks in the yaml pipeline file
+get_pipeline_tasks_path() {
+    local pipeline_file="$1"
+
+    echo "$(get_pipeline_spec_path "$pipeline_file").tasks"
+}
+
+# Return a yq query that specifies where to find the params in the yaml pipeline file
+get_pipeline_params_path() {
+    local pipeline_file="$1"
+
+    echo "$(get_pipeline_spec_path "$pipeline_file").params"
+}
+
+# Extract a named pipeline task from a pipeline definition
+find_task_in_pipeline() {
+    local pipeline_file="$1"
+    local task_name="$2"
+
+    local tasks_path=$(get_pipeline_tasks_path $pipeline_file)
+
+    # Look in the list of tasks for tasks that have the matching name in the taskRef params and pick out the first one
+    yq "[$tasks_path[] | select(.taskRef.params[] | select(.name == \"name\" and .value == \"$task_name\"))] | .[0]" < $pipeline_file
+}
+
+# Determine if a named pipeline task is present in a pipeline definition
+detect_task_in_pipeline() {
+    local pipeline_file="$1"
+    local task_name="$2"
+
+    local result=$(find_task_in_pipeline $pipeline_file $task_name)
+
+    [[ "$result" != "null" ]]
+}
+
+# Determine if any oct-ta tasks are present in a pipeline definition
+detect_oci_ta_pipeline() {
+    local pipeline_file="$1"
+
+    # The * will work as a wildcard in the yq query
+    detect_task_in_pipeline $pipeline_file "*-oci-ta"
+}
+
+# Does the pipeline include the build-image-index task?
+detect_build_image_index() {
+    local pipeline_file="$1"
+
+    detect_task_in_pipeline $pipeline_file "build-image-index"
+}
+
+DEFAULT_BEFORE_TASK_CANDIDATES="clamav-scan deprecated-image-check"
+
+default_before_task() {
+    local pipeline_file="$1"
+
+    for candidate in $DEFAULT_BEFORE_TASK_CANDIDATES; do
+        # Note: We detect the task using the name from the taskRef but it
+        # would be more intuitive if this used the local pipeline task name
+        # since that is used when inserting the task. Fix later maybe.
+        if detect_task_in_pipeline "$pipeline_file" "$candidate"; then
+            break
+        fi
+    done
+
+    # Even if it wasn't found we still return the last option
+    echo "$candidate"
+}
+
+# Create the yaml snippet for a particular pipeline task and insert it into a pipeline
+# definition right before a particular other task. Do a few sanity checks beforehand.
+insert_pipeline_task() {
+    local pipeline_file="$1"
+    local new_task_name="$2"
+    local before_task_name="$3"
+
+    # Make sure the task is a known task
+    if ! task_exists $new_task_name; then
+        echo "Can't find pipeline task '$new_task_name'. Skipping."
+        return
+    fi
+
+    if detect_oci_ta_pipeline $pipeline_file; then
+        # Pipeline is using trusted artifact tasks
+        if [[ ! $new_task_name =~ -oci-ta$ ]]; then
+            # Check if there is a -oci-ta version of the task
+            if oci_ta_task_exists $new_task_name; then
+                # Use the -oci-ta task if it exists
+                new_task_name="$new_task_name-oci-ta"
+            fi
+        fi
+    else
+        # Pipeline is not using trusted artifact tasks
+        if [[ $new_task_name =~ -oci-ta$ ]]; then
+            # Bail out if a trusted artifact task was requested
+            # (This is unusual so let's not switch tasks automatically.)
+            echo "Adding an oci-ta task to a non-oci-ta pipeline is probably a mistake. Skipping."
+            return
+        fi
+    fi
+
+    # Make sure the "before" task is present
+    if ! detect_task_in_pipeline $pipeline_file $before_task_name; then
+        echo "Before task '$before_task_name' not found in pipeline '$(basename $pipeline_file)'. Skipping."
+        return
+    fi
+
+    # Make sure we don't add it twice
+    if detect_task_in_pipeline $pipeline_file $new_task_name; then
+        echo "Task '$new_task_name' found already in pipeline '$(basename $pipeline_file)'. Skipping."
+        return
+    fi
+
+    echo "Adding task $new_task_name to pipeline $pipeline_file"
+
+    # The tasks have a name in the taskRef resolver and a name in the pipeline. Since
+    # those can be different we're now going to find the pipeline name of the "before" task,
+    # i.e. the task that we want to use to determine the place to insert the task.
+    local before_task_pipeline_name=$(find_task_in_pipeline $pipeline_file $before_task_name | yq '.name')
+
+    # Somewhere to stash the pipeline task yaml
+    local task_yaml_tmp="/tmp/$new_task_name.yaml"
+
+
+    if detect_build_image_index "$pipeline_file"; then
+        # Prepare the yaml snippet to insert (use it as is)
+        extract_pipeline_task "$new_task_name" > "$task_yaml_tmp"
+
+    elif [[ $new_task_name == "build-image-index" ]]; then
+        # If we're trying to add the build-image-index itself then leave it alone
+        extract_pipeline_task "$new_task_name" > "$task_yaml_tmp"
+
+    else
+        # Do some surgery on the yaml to (hopefully) support older pipelines where there
+        # is no build-image-index task. We're assuming there is a build-container task.
+        extract_pipeline_task "$new_task_name" | sed 's/build-image-index/build-container/g' > "$task_yaml_tmp"
+    fi
+
+    # Awk will look for this line so it knows where to insert the new task
+    local before_line_match="- name: $before_task_pipeline_name"
+
+    # Use awk instead of yq here to avoid producing unwanted formatting changes
+    awk \
+        -v new_task_file="$task_yaml_tmp" \
+        -v before_line_match="$before_line_match" \
+        '
+            function get_indent(line) {
+                match(line, /^[ ]*/)
+                return substr(line, RSTART, RLENGTH)
+            }
+
+            {
+                if ($0 ~ before_line_match && !added) {
+                    indent = get_indent($0)
+                    # Read lines from new task file
+                    while ((getline line < new_task_file) > 0) {
+                        # Apply correct indentation
+                        print indent line
+                    }
+                    close(new_task_file)
+                }
+                print
+            }
+        ' \
+        "$pipeline_file" > "$pipeline_file.tmp"
+
+    # Update the original file with the modified content
+    mv "$pipeline_file.tmp" "$pipeline_file"
+
+    # Clean up the temporary file
+    rm "$task_yaml_tmp"
+}
+
+insert_multiple_pipeline_tasks() {
+    local pipeline_file="$1"
+    local new_task_name_or_names="$2"
+    local before_task_name="$3"
+
+    # Support multiple tasks separated by a comma
+    for t in $(comma_split_tasks "$new_task_name_or_names"); do
+        insert_pipeline_task "$pipeline_file" $t "$before_task_name"
+    done
+}
+
+# A wrapper for git diff
+show_diff() {
+    local pipeline_file="$1"
+    local diff_opts="${2:-""}"
+    local dir=$(dirname $pipeline_file)
+    local file=$(basename $pipeline_file)
+
+    (cd $dir && git diff $diff_opts $file )
+}
+
+# Replace commas with spaces to split a string into multiple values
+# (Assume no spaces in the individual values)
+comma_split_tasks() {
+    local comma_separated_maybe="$1"
+
+    echo "${comma_separated_maybe//,/ }"
+}
+
+# Return a list of the Konflux pipeline definitions in the .tekton directory
+find_pipelines() {
+    local git_repo_path="$1"
+
+    # (Don't find non-standard 'kind: Pipeline' files, even though they can be patched)
+    ( cd $git_repo_path && git grep -l 'kind: PipelineRun' .tekton/*.yaml )
+}
+
+find_any_tekton_yaml() {
+    local git_repo_path="$1"
+
+    ( cd $git_repo_path && find .tekton -type f -name '*.yaml' )
+}
+
+bump_task_refs() {
+    local git_repo_path="$1"
+
+    local tekton_yaml="$git_repo_path/.tekton/*.yaml"
+    local yq_query='... | select(has("resolver")) | .params // [] | .[] | select(.name == "bundle") | .value'
+    local task_bundle_refs=$(yq "$yq_query" $tekton_yaml | grep -v -- '---' | sort -u)
+
+    for ref in $task_bundle_refs; do
+        echo -n "${ref%@*}"
+        new_ref=$(get_pinned_task_bundle_ref $ref)
+        if [[ $ref != $new_ref ]]; then
+            sed -e "s!$ref!$new_ref!" -i $tekton_yaml
+            echo -n " updated to ${new_ref#*@}"
+        fi
+        echo
+    done
+}
+
+# Run a yaml file through yq to get canonical formatting
+yq_format_yaml() {
+    local pipeline_file="$1"
+
+    yq -i . "$pipeline_file"
+}
+
+#--------------------------------------------------------------------
+# Hacky stuff for add-build-image-index
+modify_runafter() {
+    local pipeline_file="$1"
+    local old_task="$2"
+    local new_task="$3"
+
+    # Assume runAfter includes only one item, or at least the task to replace is first
+    # Replace "- $old_task" with "- $new_task" on the first line after the runAfter: key
+    awk "
+        /runAfter:/ { flag=1; print; next }
+        flag { sub(/- $old_task\$/, \"- $new_task\"); flag=0 }
+        { print }
+    " "$pipeline_file" > "$pipeline_file.tmp"
+
+    # Update the original file with the modified content
+    mv "$pipeline_file.tmp" "$pipeline_file"
+}
+
+modify_param_value_task() {
+    local pipeline_file="$1"
+    local old_task="$2"
+    local new_task="$3"
+    local task_attribute="$4"
+
+    # Replace "tasks.$old_task.$task_attribute" with "tasks.$new_task.$task_attribute"
+    awk "
+        { sub(/tasks\.$old_task\.$task_attribute/, \"tasks.$new_task.$task_attribute\"); print }
+    " "$pipeline_file" > "$pipeline_file.tmp"
+
+    # Update the original file with the modified content
+    mv "$pipeline_file.tmp" "$pipeline_file"
+}
+
+add_pipeline_param() {
+    local pipeline_file="$1"
+    local name="$2"
+    local description="$3"
+    local type="$4"
+    local default="$5"
+
+    local params_path=$(get_pipeline_params_path "$pipeline_file")
+
+    # I don't think it's practical to use awk here, so get ready for some
+    # yaml formatting changes. Todo: Avoid that somehow...
+    yq -i "$params_path += [
+        {\"name\":\"$name\", \"description\":\"$description\", \"type\":\"$type\", \"default\":\"$default\"}
+    ]" $pipeline_file
+}
+#--------------------------------------------------------------------
+
+# Just the usage part of the help
+usage() {
+    cat <<EOT
+# Show a list of known pipeline tasks
+${0} list-tasks
+
+# Show the latest trusted bundle ref for given pipeline task
+${0} task-ref <task-name> <version>
+${0} task-ref <task-name>:<version>
+${0} task-ref <task-bundle-ref>
+
+# Lookup tasks in the trusted task data and output all the known
+# bundle digests and their related dates
+${0} trusted-task-lookup [<task-name-or-substring>]
+
+# Output a snippet of yaml suitable for adding a task to a Konflux pipeline
+${0} task-yaml <task-name>
+
+# Modify a single Konflux pipeline definition to add a new task
+# Supports multiple comma-separated task names
+# The <before-task-name> is used to specify where in the yaml file to add the new
+# task. If unset, 'clamav-scan' and 'deprecated-image-check' will be tried.
+${0} patch <path-to-pipeline-yaml> <new-task-name-or-names> [<before-task-name>]
+
+# Modify all the Konflux pipelines in a git repo to add a new task
+# Supports multiple comma-separated task names. (See above re <before-task-name>).
+${0} add-tasks <path-to-git-repo> <new-task-name-or-names> [<before-task-name>]
+
+# Update task bundle references in your pipeline definitions to the latest
+# newest digests from the trusted task list. (Manually perform the kind of
+# update usually done by MintMaker or Renovate.)
+${0} bump-task-refs <path-to-git-repo>
+
+# Attempt to add the "build-image-index" task and make the required pipeline
+# migration changes so that it works as intended. Beware this is not well
+# tested. See https://issues.redhat.com/browse/EC-1202 for more details.
+${0} add-build-image-index <path-to-git-repo>
+
+# Show this help
+${0} help
+EOT
+}
+
+# Show help for the command line options
+show_help() {
+    cat <<EOT
+Konflux Pipeline Patcher
+
+Usage:
+$(usage | indented)
+
+Source:
+  https://github.com/simonbaird/konflux-pipeline-patcher
+EOT
+}
+
+# Show usage information if the required number of args are
+# not provided, instead of an error like `$3: unbound variable`
+required_args() {
+    local required_count=$1
+    if [[ "$ARG_COUNT" < $required_count ]]; then
+        echo "Usage:"
+        usage | grep $MAIN_CMD | indented
+        exit 1
+    fi
+}
+
+MAIN_CMD="${1:-""}"
+ARG_COUNT="$#"
+
+check_dependency() {
+    local dependencies="$@"
+    for d in $dependencies; do
+        if ! which "$d" > /dev/null 2>&1; then
+            echo "Can't find required dependency '$d' in path. Aborting."
+            exit 1
+        fi
+
+        case $d in
+            "yq")
+                if ! yq --version 2>&1 | grep -q 'mikefarah/yq'; then
+                    echo "It looks like you have the wrong version of yq installed. Aborting."
+                    echo "Please install yq from https://github.com/mikefarah/yq/releases/latest"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+}
+
+check_dependency curl awk jq git yq oras
+
+# Main command handler
+case "$MAIN_CMD" in
+    "list-tasks")
+        list_known_tasks
+        ;;
+
+    # Search for tasks in the trusted task list
+    "trusted-task-lookup")
+        SEARCH_OPT="${2:-""}"
+        case $SEARCH_OPT in
+            "--raw")
+                # Show everything
+                TRUSTED_TASKS_FILTER="."
+                ;;
+            *)
+                # Show just Tekton task bundles that match $SEARCH_OPT,
+                # or show all of them if $SEARCH_OPT is an empty string
+                TRUSTED_TASKS_FILTER="with_entries(select(.key | test(\"^oci://$KONFLUX_CATALOG/task-.*$SEARCH_OPT\")))"
+                ;;
+        esac
+        trusted_task_data | yq ".trusted_tasks | $TRUSTED_TASKS_FILTER"
+        ;;
+
+    "task-ref")
+        required_args 2
+        TASK_NAME_OR_REF="$2"
+        VERSION_MAYBE="${3:-""}"
+
+        # Remove oci:// prefix if it is present
+        TASK_NAME_OR_REF="${TASK_NAME_OR_REF#oci://}"
+
+        # If there is still a ":" char then assume the version tag is after the ":".
+        # If there is no ":" char then required the version tag to be specified separately.
+        if [[ ! "$TASK_NAME_OR_REF" =~ : ]]; then
+            required_args 3
+        fi
+
+        # Todo maybe: List all the versions if version is not specified
+        get_pinned_task_bundle_ref "$TASK_NAME_OR_REF" "$VERSION_MAYBE"
+        ;;
+
+    "task-yaml")
+        required_args 2
+        TASK_NAME="$2"
+
+        extract_pipeline_task "$TASK_NAME"
+        ;;
+
+    "patch")
+        required_args 3
+        PIPELINE_FILE="$2"
+        NEW_TASK_NAME_OR_NAMES="$3"
+        BEFORE_TASK_NAME="${4:-$(default_before_task "$PIPELINE_FILE")}"
+
+        insert_multiple_pipeline_tasks "$PIPELINE_FILE" "$NEW_TASK_NAME_OR_NAMES" "$BEFORE_TASK_NAME"
+        show_diff $PIPELINE_FILE
+        ;;
+
+    "add-tasks"|"patch-all")
+        required_args 3
+        GIT_REPO_PATH="$2"
+        NEW_TASK_NAME_OR_NAMES="$3"
+
+        for p in $(find_pipelines $GIT_REPO_PATH); do
+            BEFORE_TASK_NAME="${4:-$(default_before_task "$GIT_REPO_PATH/$p")}"
+            insert_multiple_pipeline_tasks "$GIT_REPO_PATH/$p" "$NEW_TASK_NAME_OR_NAMES" "$BEFORE_TASK_NAME"
+        done
+        show_diff "$GIT_REPO_PATH/.tekton" --stat
+        ;;
+
+    "bump-task-refs")
+        check_dependency sed
+        GIT_REPO_PATH="${2:-"."}"
+        bump_task_refs "$GIT_REPO_PATH"
+        ;;
+
+    # In cases where this script introduces yaml formatting changes, this can be used to
+    # keep formatting changes in one commit separate from the actual significant changes
+    "format-yaml")
+        GIT_REPO_PATH="${2:-"."}"
+        for p in $(find_any_tekton_yaml $GIT_REPO_PATH); do
+            yq_format_yaml "$GIT_REPO_PATH/$p"
+        done
+        ;;
+
+    # For pipelines that don't yet have the build-image-index task this should do
+    # most of the work to add it. YMMV. See https://issues.redhat.com/browse/EC-1202
+    "add-build-image-index")
+        required_args 2
+        GIT_REPO_PATH="$2"
+        for p in $(find_pipelines $GIT_REPO_PATH); do
+            full_path="$GIT_REPO_PATH/$p"
+            modify_runafter "$full_path" build-container build-image-index
+            modify_param_value_task "$full_path" build-container build-image-index results.IMAGE_URL
+            modify_param_value_task "$full_path" build-container build-image-index results.IMAGE_DIGEST
+            modify_param_value_task "$full_path" build-container build-image-index status
+            add_pipeline_param "$full_path" build-image-index "Add built image into an OCI image index" string false
+            insert_pipeline_task "$full_path" build-image-index source-build
+        done
+        ;;
+
+    # For convenience since this can go directly into the readme
+    "usage")
+        usage
+        ;;
+
+    "help")
+        show_help
+        ;;
+
+    *)
+        # Suppress output for shellspec Include
+        if [[ -z ${SHELLSPEC_ROOT:-""} ]]; then
+            show_help
+        fi
+        ;;
+esac
+
+# vim: sw=4

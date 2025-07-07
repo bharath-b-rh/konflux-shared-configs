@@ -88,7 +88,7 @@ jobs:
 
 ## Pipeline Mappings
 
-The pipeline mappings are configured directly in the Python script. To customize for your repository, edit the `PIPELINE_MAPPINGS` dictionary in the action script:
+The pipeline mappings are configured directly in the `scripts/sync-pipeline-configs.py` file. To customize for your repository, edit the `PIPELINE_MAPPINGS` dictionary in that script:
 
 ```python
 PIPELINE_MAPPINGS = {
@@ -159,7 +159,7 @@ Ensure your repository has the following permissions enabled:
 
 ### 3. Customize for Your Project
 
-Update the `PIPELINE_MAPPINGS` dictionary in the action script to match your project's pipeline structure and requirements. Edit `.github/actions/sync-konflux-pipelines/action.yml` and modify the Python script section:
+Update the `PIPELINE_MAPPINGS` dictionary in the standalone script to match your project's pipeline structure and requirements. Edit `scripts/sync-pipeline-configs.py` and modify the configuration section:
 
 ```python
 PIPELINE_MAPPINGS = {
@@ -173,8 +173,8 @@ PIPELINE_MAPPINGS = {
 
 This action is designed to be reusable across different OpenShift repositories that use Konflux pipelines. To use it in other projects:
 
-1. **Copy the action**: Copy the entire `.github/actions/sync-konflux-pipelines` directory to your repository
-2. **Customize mappings**: Update the `PIPELINE_MAPPINGS` dictionary in the Python script to match your repository's pipeline locations
+1. **Copy the action**: Copy the entire `.github/actions/sync-konflux-pipelines` directory and `scripts/sync-pipeline-configs.py` file to your repository
+2. **Customize mappings**: Update the `PIPELINE_MAPPINGS` dictionary in `scripts/sync-pipeline-configs.py` to match your repository's pipeline locations
 3. **Configure schedule**: Adjust the cron schedule to fit your maintenance schedule
 4. **Set permissions**: Ensure the workflow has `contents: write` and `pull-requests: write` permissions
 
@@ -189,7 +189,7 @@ with:
   pr_labels: "infrastructure,automation"
 ```
 
-Then customize the `PIPELINE_MAPPINGS` in the action script:
+Then customize the `PIPELINE_MAPPINGS` in the `scripts/sync-pipeline-configs.py` file:
 
 ```python
 PIPELINE_MAPPINGS = {
@@ -219,7 +219,7 @@ The action automatically downloads the `konflux-pipeline-patcher` tool when need
 
 ### Pipeline Mappings
 
-To add or modify pipeline mappings, edit the `PIPELINE_MAPPINGS` dictionary in the Python script embedded in the action.yml file. Each entry maps an upstream pipeline URL to a local file path.
+To add or modify pipeline mappings, edit the `PIPELINE_MAPPINGS` dictionary in the `scripts/sync-pipeline-configs.py` file. Each entry maps an upstream pipeline URL to a local file path.
 
 ## Example Repositories
 

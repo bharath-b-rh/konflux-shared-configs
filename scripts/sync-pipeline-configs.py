@@ -29,8 +29,8 @@ from typing import Dict, Any, List, Set
 # Configuration - Pipeline mappings: upstream_url -> local_path
 PIPELINE_MAPPINGS = {
     'https://raw.githubusercontent.com/konflux-ci/build-definitions/main/pipelines/fbc-builder/fbc-builder.yaml': '.tekton/fbc-build-pipeline.yaml',
-    'https://raw.githubusercontent.com/konflux-ci/build-definitions/main/pipelines/docker-build-oci-ta/docker-build-oci-ta.yaml': '.tekton/single-arch-build-pipeline.yaml',
-    'https://raw.githubusercontent.com/konflux-ci/build-definitions/main/pipelines/docker-build-multi-platform-oci-ta/docker-build-multi-platform-oci-ta.yaml': '.tekton/multi-arch-build-pipeline.yaml',
+    # Add more pipeline mappings here as needed
+    # 'https://raw.githubusercontent.com/konflux-ci/build-definitions/main/pipelines/docker-build/docker-build.yaml': '.tekton/docker-build-pipeline.yaml',
 }
 
 
@@ -360,9 +360,17 @@ def prompt_user_action(message: str, options: List[str]) -> str:
 def main():
     """Main function to orchestrate pipeline comparison and sync."""
     
-    # Parse command-line arguments
-    auto_patch = "--auto-patch" in sys.argv
-    update_refs = "--update-refs" in sys.argv
+    # Check if running in GitHub Action mode
+    github_action_mode = os.environ.get('GITHUB_ACTION_MODE', 'false') == 'true'
+    
+    if github_action_mode:
+        # Parse configuration from environment variables
+        auto_patch = os.environ.get('AUTO_PATCH', 'false') == 'true'
+        update_refs = os.environ.get('UPDATE_REFS', 'false') == 'true'
+    else:
+        # Parse command-line arguments
+        auto_patch = "--auto-patch" in sys.argv
+        update_refs = "--update-refs" in sys.argv
     
     print("=== Pipeline Sync Script ===")
     print(f"Processing {len(PIPELINE_MAPPINGS)} pipeline(s)")
@@ -428,7 +436,8 @@ def main():
                 'upstream_url': upstream_url,
                 'local_path': local_path,
                 'missing_tasks': missing_tasks,
-                'has_updates': has_updates
+                'has_updates': has_updates,
+                'missing_tasks_patched': False  # Will be updated later if patching occurs
             })
             
         except Exception as e:
@@ -460,12 +469,15 @@ def main():
             
             if patcher_path:
                 # Patch missing tasks for each pipeline
-                for pipeline_info in all_processed_pipelines:
+                for i, pipeline_info in enumerate(all_processed_pipelines):
                     if pipeline_info['missing_tasks']:
                         print(f"\n🔧 Patching missing tasks for {pipeline_info['local_path']}...")
                         patch_success = patch_missing_tasks(patcher_path, pipeline_info['local_path'], pipeline_info['missing_tasks'])
                         
                         if patch_success:
+                            # Update the pipeline info to track patching success
+                            all_processed_pipelines[i]['missing_tasks_patched'] = True
+                            
                             print("🔄 Reloading pipeline after patching...")
                             local_pipeline = load_local_pipeline(pipeline_info['local_path'])
                             local_tasks = get_task_names(local_pipeline.get('spec', {}))
@@ -501,10 +513,36 @@ def main():
     print(f"Updates made: {overall_has_updates}")
     print(f"Missing tasks found: {len(overall_missing_tasks)}")
     
-    print("\nUsage options:")
-    print("  python3 scripts/sync-pipeline-configs.py                # Interactive mode")
-    print("  python3 scripts/sync-pipeline-configs.py --auto-patch   # Auto-patch missing tasks")
-    print("  python3 scripts/sync-pipeline-configs.py --update-refs  # Update task bundle references")
+    # Set GitHub Action outputs if running in action mode
+    if github_action_mode and 'GITHUB_OUTPUT' in os.environ:
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"updated={str(overall_has_updates).lower()}\n")
+            f.write(f"pipelines_processed={len(all_processed_pipelines)}\n")
+            f.write(f"missing_tasks_found={str(bool(overall_missing_tasks)).lower()}\n")
+            f.write(f"missing_tasks_patched={str(any(info.get('missing_tasks_patched', False) for info in all_processed_pipelines)).lower()}\n")
+        
+        # Generate changes summary
+        all_changes = []
+        for pipeline_info in all_processed_pipelines:
+            if pipeline_info.get('has_updates', False):
+                all_changes.append(f"- Updated {pipeline_info['local_path']} from upstream")
+            if pipeline_info.get('missing_tasks_patched', False):
+                missing_count = len(pipeline_info.get('missing_tasks', set()))
+                all_changes.append(f"- Patched {missing_count} missing tasks in {pipeline_info['local_path']}")
+            elif pipeline_info.get('missing_tasks', set()):
+                missing_count = len(pipeline_info['missing_tasks'])
+                all_changes.append(f"- Found {missing_count} missing tasks in {pipeline_info['local_path']} (auto-patch disabled)")
+        
+        changes_summary = "\n".join(all_changes) if all_changes else "No changes made"
+        
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"changes_summary<<EOF\n{changes_summary}\nEOF\n")
+    
+    if not github_action_mode:
+        print("\nUsage options:")
+        print("  python3 scripts/sync-pipeline-configs.py                # Interactive mode")
+        print("  python3 scripts/sync-pipeline-configs.py --auto-patch   # Auto-patch missing tasks")
+        print("  python3 scripts/sync-pipeline-configs.py --update-refs  # Update task bundle references")
 
 
 if __name__ == "__main__":
