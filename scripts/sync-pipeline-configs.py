@@ -29,8 +29,8 @@ from typing import Dict, Any, List, Set
 # Configuration - Pipeline mappings: upstream_url -> local_path
 PIPELINE_MAPPINGS = {
     'https://raw.githubusercontent.com/konflux-ci/build-definitions/main/pipelines/fbc-builder/fbc-builder.yaml': '.tekton/fbc-build-pipeline.yaml',
-    # Add more pipeline mappings here as needed
-    # 'https://raw.githubusercontent.com/konflux-ci/build-definitions/main/pipelines/docker-build/docker-build.yaml': '.tekton/docker-build-pipeline.yaml',
+    'https://raw.githubusercontent.com/konflux-ci/build-definitions/main/pipelines/docker-build-oci-ta/docker-build-oci-ta.yaml': '.tekton/single-arch-build-pipeline.yaml',
+    'https://raw.githubusercontent.com/konflux-ci/build-definitions/main/pipelines/docker-build-multi-platform-oci-ta/docker-build-multi-platform-oci-ta.yaml': '.tekton/multi-arch-build-pipeline.yaml',
 }
 
 
